@@ -1,0 +1,339 @@
+name: Validate Skill Files
+
+on:
+  pull_request:
+    paths:
+      - "skills/**/*.md"
+
+jobs:
+  validate:
+    name: Validate Modified Skill Files
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install PyYAML
+
+      - name: Get changed skill files
+        id: changed_files
+        run: |
+          # Get list of changed .md files in the skills/ directory (excluding README and _template)
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '^skills/.*\.md$' \
+            | grep -v '^skills/README\.md$' \
+            | grep -v '^skills/_template\.md$' \
+            || true)
+          
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Changed skill files:"
+          echo "$CHANGED"
+
+      - name: Validate skill files
+        id: validate
+        run: |
+          cat << 'PYEOF' > /tmp/validate_skills.py
+          import sys
+          import os
+          import re
+          import yaml
+          import json
+
+          REQUIRED_FRONTMATTER_FIELDS = [
+              "skill_id",
+              "name",
+              "version",
+              "status",
+              "autonomy_level",
+              "tags",
+              "author",
+          ]
+
+          VALID_STATUSES = {"draft", "testing", "active", "deprecated"}
+
+          VALID_AUTONOMY_LEVELS = {
+              "0_tool",
+              "1_assistant",
+              "2_advisor",
+              "3_collaborator",
+              "4_actor",
+          }
+
+          VALID_VERSION_PATTERN = re.compile(r"^v\d+\.\d+(\.\d+)?$")
+
+          REQUIRED_SECTIONS = [
+              "Description",
+              "Input Schema",
+              "Output Schema",
+              "System Prompt",
+              "Examples",
+              "HITL Rules",
+              "Changelog",
+          ]
+
+          def validate_skill_file(filepath):
+              errors = []
+              warnings = []
+
+              with open(filepath, "r") as f:
+                  content = f.read()
+
+              # Check frontmatter exists
+              if not content.startswith("---"):
+                  errors.append("Missing YAML frontmatter block. File must start with '---'.")
+                  return errors, warnings
+
+              # Extract frontmatter
+              end_idx = content.find("
+---", 3)
+              if end_idx == -1:
+                  errors.append("Frontmatter block not properly closed with '---'.")
+                  return errors, warnings
+
+              fm_text = content[3:end_idx].strip()
+
+              try:
+                  frontmatter = yaml.safe_load(fm_text)
+              except yaml.YAMLError as e:
+                  errors.append(f"Invalid YAML frontmatter: {e}")
+                  return errors, warnings
+
+              if not isinstance(frontmatter, dict):
+                  errors.append("Frontmatter must be a YAML mapping (key: value pairs).")
+                  return errors, warnings
+
+              # Check required fields
+              for field in REQUIRED_FRONTMATTER_FIELDS:
+                  if field not in frontmatter:
+                      errors.append(f"Missing required frontmatter field: '{field}'")
+                  elif frontmatter[field] is None or frontmatter[field] == "":
+                      errors.append(f"Required frontmatter field '{field}' is empty.")
+
+              # Validate field values if present
+              if "status" in frontmatter and frontmatter["status"] not in VALID_STATUSES:
+                  errors.append(
+                      f"Invalid status: '{frontmatter['status']}'. "
+                      f"Must be one of: {', '.join(sorted(VALID_STATUSES))}"
+                  )
+
+              if "autonomy_level" in frontmatter and frontmatter["autonomy_level"] not in VALID_AUTONOMY_LEVELS:
+                  errors.append(
+                      f"Invalid autonomy_level: '{frontmatter['autonomy_level']}'. "
+                      f"Must be one of: {', '.join(sorted(VALID_AUTONOMY_LEVELS))}"
+                  )
+
+              if "version" in frontmatter and frontmatter["version"]:
+                  version_str = str(frontmatter["version"])
+                  if not VALID_VERSION_PATTERN.match(version_str):
+                      errors.append(
+                          f"Invalid version format: '{version_str}'. "
+                          "Must match v{{major}}.{{minor}} (e.g. v1.0 or v1.2.3)"
+                      )
+
+              # Validate skill_id format (domain.verb_noun)
+              if "skill_id" in frontmatter and frontmatter["skill_id"]:
+                  skill_id = str(frontmatter["skill_id"])
+                  if not re.match(r"^[a-z][a-z0-9]*\.[a-z][a-z0-9_]*$", skill_id):
+                      errors.append(
+                          f"Invalid skill_id format: '{skill_id}'. "
+                          "Must match domain.verb_noun (lowercase, underscores only, e.g. social.post_generator)"
+                      )
+                  else:
+                      # Check that skill_id matches file path
+                      domain, skill_name = skill_id.split(".", 1)
+                      expected_path_fragment = f"skills/{domain}/{skill_name}.md"
+                      if not filepath.endswith(expected_path_fragment):
+                          warnings.append(
+                              f"skill_id '{skill_id}' suggests file should be at "
+                              f"'{expected_path_fragment}', but file is at '{filepath}'"
+                          )
+
+              # Validate tags is a list
+              if "tags" in frontmatter and frontmatter["tags"] is not None:
+                  if not isinstance(frontmatter["tags"], list):
+                      errors.append("'tags' must be a YAML list (e.g. [] or [tag1, tag2])")
+
+              # Check required sections
+              body = content[end_idx + 3:].strip()
+              for section in REQUIRED_SECTIONS:
+                  pattern = rf"^##\s+{re.escape(section)}\s*$"
+                  if not re.search(pattern, body, re.MULTILINE):
+                      errors.append(f"Missing required section: '## {section}'")
+
+              # Check for unfilled template placeholders
+              placeholder_pattern = re.compile(r"\[PLACEHOLDER\]|\[YOUR.*?\]|Lorem ipsum", re.IGNORECASE)
+              placeholder_matches = placeholder_pattern.findall(body)
+              if placeholder_matches:
+                  warnings.append(
+                      f"Possible unfilled template placeholders found: {placeholder_matches[:3]}"
+                  )
+
+              return errors, warnings
+
+
+          def main():
+              files_str = os.environ.get("CHANGED_FILES", "").strip()
+              if not files_str:
+                  print("No skill files changed. Skipping validation.")
+                  print("::set-output name=result::pass")
+                  print("::set-output name=summary::No skill files changed.")
+                  return 0
+
+              files = [f.strip() for f in files_str.split("
+") if f.strip()]
+
+              all_results = []
+              has_errors = False
+
+              for filepath in files:
+                  if not os.path.exists(filepath):
+                      all_results.append({
+                          "file": filepath,
+                          "status": "deleted",
+                          "errors": [],
+                          "warnings": []
+                      })
+                      continue
+
+                  errors, warnings = validate_skill_file(filepath)
+                  status = "pass" if not errors else "fail"
+                  if errors:
+                      has_errors = True
+
+                  all_results.append({
+                      "file": filepath,
+                      "status": status,
+                      "errors": errors,
+                      "warnings": warnings,
+                  })
+
+              # Build comment
+              lines = ["## Skill Validation Results
+"]
+
+              pass_count = sum(1 for r in all_results if r["status"] == "pass")
+              fail_count = sum(1 for r in all_results if r["status"] == "fail")
+              deleted_count = sum(1 for r in all_results if r["status"] == "deleted")
+
+              if has_errors:
+                  lines.append(f"\u274c **{fail_count} file(s) failed validation.** Fix the errors below before merging.
+")
+              else:
+                  lines.append(f"\u2705 **All {pass_count} skill file(s) passed validation.**
+")
+
+              lines.append(f"| | Count |")
+              lines.append(f"|---|---|")
+              lines.append(f"| \u2705 Passed | {pass_count} |")
+              lines.append(f"| \u274c Failed | {fail_count} |")
+              lines.append(f"| \U0001f5d1\ufe0f Deleted | {deleted_count} |")
+              lines.append("")
+
+              for result in all_results:
+                  if result["status"] == "deleted":
+                      lines.append(f"### \U0001f5d1\ufe0f `{result['file']}` \u2014 deleted")
+                  elif result["status"] == "pass":
+                      lines.append(f"### \u2705 `{result['file']}`")
+                      if result["warnings"]:
+                          lines.append("")
+                          for w in result["warnings"]:
+                              lines.append(f"- \u26a0\ufe0f **Warning:** {w}")
+                  else:
+                      lines.append(f"### \u274c `{result['file']}`")
+                      lines.append("")
+                      for e in result["errors"]:
+                          lines.append(f"- \U0001f6ab **Error:** {e}")
+                      if result["warnings"]:
+                          for w in result["warnings"]:
+                              lines.append(f"- \u26a0\ufe0f **Warning:** {w}")
+                  lines.append("")
+
+              if has_errors:
+                  lines.append("---")
+                  lines.append("**How to fix:** See [`skills/_template.md`](../../skills/_template.md) for the required format and [`CONTRIBUTING.md`](../../CONTRIBUTING.md) for field requirements.")
+
+              comment_body = "
+".join(lines)
+
+              # Write outputs
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"result={'fail' if has_errors else 'pass'}
+")
+
+              with open("/tmp/pr_comment.txt", "w") as f:
+                  f.write(comment_body)
+
+              print(comment_body)
+              return 1 if has_errors else 0
+
+          sys.exit(main())
+          PYEOF
+
+          python /tmp/validate_skills.py
+        env:
+          CHANGED_FILES: ${{ steps.changed_files.outputs.changed_files }}
+          GITHUB_OUTPUT: ${{ github.output }}
+
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment;
+            try {
+              comment = fs.readFileSync('/tmp/pr_comment.txt', 'utf8');
+            } catch (e) {
+              comment = '## Skill Validation
+
+No skill files were changed in this PR.';
+            }
+
+            // Find existing bot comment to update instead of creating a new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c => 
+              c.user.type === 'Bot' && 
+              c.body.includes('Skill Validation Results')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
+
+      - name: Fail if validation errors
+        if: steps.validate.outputs.result == 'fail'
+        run: |
+          echo "Skill validation failed. See PR comment for details."
+          exit 1
